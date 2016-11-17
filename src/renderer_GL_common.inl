@@ -815,7 +815,7 @@ static void disableTexturing(GPU_Renderer* renderer)
     }
 }
 
-static void upload_texture(const void* pixels, GPU_Rect update_rect, Uint32 format, int alignment, int row_length, int bytes_per_pixel)
+static void upload_texture(const void* pixels, GPU_Rect update_rect, Uint32 format, int alignment, int row_length, unsigned int pitch)
 {
     glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
     #if defined(SDL_GPU_USE_OPENGL) || SDL_GPU_GLES_MAJOR_VERSION > 2
@@ -829,7 +829,6 @@ static void upload_texture(const void* pixels, GPU_Rect update_rect, Uint32 form
     #else
     unsigned int i;
     unsigned int h = update_rect.h;
-    unsigned int pitch = row_length * bytes_per_pixel;
     if(h > 0 && update_rect.w > 0.0f)
     {
         // Must upload row by row to account for row length
@@ -862,12 +861,28 @@ static void upload_new_texture(void* pixels, GPU_Rect update_rect, Uint32 format
                  format, GL_UNSIGNED_BYTE, NULL);
     
     // Alignment is reset in upload_texture()
-    upload_texture(pixels, update_rect, format, alignment, row_length, bytes_per_pixel);
+    upload_texture(pixels, update_rect, format, alignment, row_length, row_length*bytes_per_pixel);
     #endif
 }
 
 #define MIX_COLOR_COMPONENT_NORMALIZED_RESULT(a, b) ((a)/255.0f * (b)/255.0f)
 #define MIX_COLOR_COMPONENT(a, b) (((a)/255.0f * (b)/255.0f)*255)
+
+static SDL_Color get_complete_mod_color(GPU_Renderer* renderer, GPU_Target* target, GPU_Image* image)
+{
+    if(target->use_color)
+    {
+		SDL_Color color;
+		color.r = MIX_COLOR_COMPONENT(target->color.r, image->color.r);
+		color.g = MIX_COLOR_COMPONENT(target->color.g, image->color.g);
+		color.b = MIX_COLOR_COMPONENT(target->color.b, image->color.b);
+		GET_ALPHA(color) = MIX_COLOR_COMPONENT(GET_ALPHA(target->color), GET_ALPHA(image->color));
+
+        return color;
+    }
+    else
+        return image->color;
+}
 
 static void prepareToRenderImage(GPU_Renderer* renderer, GPU_Target* target, GPU_Image* image)
 {
@@ -881,18 +896,7 @@ static void prepareToRenderImage(GPU_Renderer* renderer, GPU_Target* target, GPU
     }
 
     // Blitting
-    if(target->use_color)
-    {
-		SDL_Color color;
-		color.r = MIX_COLOR_COMPONENT(target->color.r, image->color.r);
-		color.g = MIX_COLOR_COMPONENT(target->color.g, image->color.g);
-		color.b = MIX_COLOR_COMPONENT(target->color.b, image->color.b);
-		GET_ALPHA(color) = MIX_COLOR_COMPONENT(GET_ALPHA(target->color), GET_ALPHA(image->color));
-
-        changeColor(renderer, color);
-    }
-    else
-        changeColor(renderer, image->color);
+    changeColor(renderer, get_complete_mod_color(renderer, target, image));
     changeBlending(renderer, image->use_blending);
     changeBlendMode(renderer, image->blend_mode);
 
@@ -2928,52 +2932,6 @@ static void FreeFormat(SDL_PixelFormat* format)
     SDL_free(format);
 }
 
-#ifdef SDL_GPU_USE_GLES
-// Based on SDL_UpdateTexture()
-static SDL_Surface* pack_surface_if_needed(SDL_Surface* surface)
-{
-	SDL_Surface* result;
-	int width, height;
-	int packed_pitch;
-	int pitch;
-
-    // NULL or already packed?
-	if(surface == NULL || surface->pitch == surface->w * surface->format->BytesPerPixel)
-        return surface;
-
-	width = surface->w;
-	height = surface->h;
-    packed_pitch = width * surface->format->BytesPerPixel;
-    pitch = surface->pitch;
-
-    // Bail out if we're supposed to update an empty rectangle
-    if(width <= 0 || height <= 0)
-        return NULL;
-
-    // Reformat the data into a tightly packed array
-    result = SDL_CreateRGBSurface(SDL_SWSURFACE, width, height, surface->format->BytesPerPixel, surface->format->Rmask, surface->format->Gmask, surface->format->Bmask, surface->format->Amask);
-
-    if(result == NULL)
-    {
-        GPU_PushErrorCode(__func__, GPU_ERROR_DATA_ERROR, "Failed to create new %dx%d surface", width, height);
-        return NULL;
-    }
-
-    // Force a new pitch in spite of SDL's alignment calculations
-    result->pitch = packed_pitch;
-
-    // Copy to the new surface
-    {
-        int i;
-        for(i = 0; i < width; ++i)
-        {
-            memcpy((Uint8*)result->pixels + i*packed_pitch, surface->pixels + surface->pitch*i, packed_pitch);
-        }
-    }
-
-    return result;
-}
-#endif
 
 // Returns NULL on failure.  Returns the original surface if no copy is needed.  Returns a new surface converted to the right format otherwise.
 static SDL_Surface* copySurfaceIfNeeded(GPU_Renderer* renderer, GLenum glFormat, SDL_Surface* surface, GLenum* surfaceFormatResult)
@@ -3001,23 +2959,11 @@ static SDL_Surface* copySurfaceIfNeeded(GPU_Renderer* renderer, GLenum glFormat,
             *surfaceFormatResult = glFormat;
     }
 
-    #ifdef SDL_GPU_USE_GLES
-    // GLES needs a tightly-packed pixel array
-    {
-        SDL_Surface* intermediate_surface = surface;
-        surface = pack_surface_if_needed(intermediate_surface);
-
-        // Delete the intermediate surface since it won't be used.
-        if(intermediate_surface != surface && intermediate_surface != original)
-            SDL_FreeSurface(intermediate_surface);
-    }
-    #endif
-
     // No copy needed
     return surface;
 }
 
-static GPU_Image* CopyImage(GPU_Renderer* renderer, GPU_Image* image)
+static GPU_Image* gpu_copy_image_pixels_only(GPU_Renderer* renderer, GPU_Image* image)
 {
     GPU_Image* result = NULL;
 
@@ -3135,6 +3081,18 @@ static GPU_Image* CopyImage(GPU_Renderer* renderer, GPU_Image* image)
             GPU_PushErrorCode("GPU_CopyImage", GPU_ERROR_BACKEND_ERROR, "Could not copy the given image format.");
         break;
     }
+
+    return result;
+}
+
+static GPU_Image* CopyImage(GPU_Renderer* renderer, GPU_Image* image)
+{
+    GPU_Image* result = NULL;
+
+    if(image == NULL)
+        return NULL;
+
+    result = gpu_copy_image_pixels_only(renderer, image);
 
     if(result != NULL)
     {
@@ -3266,7 +3224,7 @@ static void UpdateImage(GPU_Renderer* renderer, GPU_Image* image, const GPU_Rect
     // Shift the pixels pointer to the proper source position
     pixels += (int)(newSurface->pitch * sourceRect.y + (newSurface->format->BytesPerPixel)*sourceRect.x);
     
-    upload_texture(pixels, updateRect, original_format, alignment, (newSurface->pitch / newSurface->format->BytesPerPixel), newSurface->format->BytesPerPixel);
+    upload_texture(pixels, updateRect, original_format, alignment, (newSurface->pitch / newSurface->format->BytesPerPixel), newSurface->pitch);
     
 
     // Delete temporary surface
@@ -3335,7 +3293,7 @@ static void UpdateImageBytes(GPU_Renderer* renderer, GPU_Image* image, const GPU
     while(bytes_per_row % alignment)
         alignment >>= 1;
     
-    upload_texture(bytes, updateRect, original_format, alignment, (bytes_per_row / image->bytes_per_pixel), image->bytes_per_pixel);
+    upload_texture(bytes, updateRect, original_format, alignment, (bytes_per_row / image->bytes_per_pixel), bytes_per_row);
     
 }
 
@@ -3600,17 +3558,23 @@ static GPU_Image* CopyImageFromSurface(GPU_Renderer* renderer, SDL_Surface* surf
 
 static GPU_Image* CopyImageFromTarget(GPU_Renderer* renderer, GPU_Target* target)
 {
-	SDL_Surface* surface;
-	GPU_Image* image;
+	GPU_Image* result;
 
     if(target == NULL)
         return NULL;
+    
+    if(target->image != NULL)
+    {
+        result = gpu_copy_image_pixels_only(renderer, target->image);
+    }
+    else
+    {
+        SDL_Surface* surface = renderer->impl->CopySurfaceFromTarget(renderer, target);
+        result = renderer->impl->CopyImageFromSurface(renderer, surface);
+        SDL_FreeSurface(surface);
+    }
 
-    surface = renderer->impl->CopySurfaceFromTarget(renderer, target);
-    image = renderer->impl->CopyImageFromSurface(renderer, surface);
-    SDL_FreeSurface(surface);
-
-    return image;
+    return result;
 }
 
 
@@ -4487,8 +4451,9 @@ static_inline void submit_buffer_data(int bytes, float* values, int bytes_indice
 {
     #ifdef SDL_GPU_USE_BUFFER_PIPELINE
         #ifdef SDL_GPU_USE_BUFFER_MAPPING
+        // NOTE: On the Raspberry Pi, you may have to use GL_DYNAMIC_DRAW instead of GL_STREAM_DRAW for buffers to work with glMapBuffer().
         float* data = (float*)glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
-        unsigned short* data_i = (unsigned short*)glMapBuffer(GL_ELEMENT_ARRAY_BUFFER, GL_WRITE_ONLY);
+        unsigned short* data_i = (indices == NULL? NULL : (unsigned short*)glMapBuffer(GL_ELEMENT_ARRAY_BUFFER, GL_WRITE_ONLY));
         if(data != NULL)
         {
             memcpy(data, values, bytes);
@@ -4501,15 +4466,18 @@ static_inline void submit_buffer_data(int bytes, float* values, int bytes_indice
         }
         #elif defined(SDL_GPU_USE_BUFFER_RESET)
         glBufferData(GL_ARRAY_BUFFER, bytes, values, GL_STREAM_DRAW);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, bytes_indices, indices, GL_DYNAMIC_DRAW);
+        if(indices != NULL)
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, bytes_indices, indices, GL_DYNAMIC_DRAW);
         #else
         glBufferSubData(GL_ARRAY_BUFFER, 0, bytes, values);
-        glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, bytes_indices, indices);
+        if(indices != NULL)
+            glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, bytes_indices, indices);
         #endif
     #endif
 }
 
 
+static void SetAttributefv(GPU_Renderer* renderer, int location, int num_elements, float* value);
 
 // Assumes the right format
 static void TriangleBatchX(GPU_Renderer* renderer, GPU_Image* image, GPU_Target* target, unsigned short num_vertices, void* values, unsigned int num_indices, unsigned short* indices, GPU_BatchFlagEnum flags)
@@ -4525,7 +4493,7 @@ static void TriangleBatchX(GPU_Renderer* renderer, GPU_Image* image, GPU_Target*
 	GPU_bool use_colors = (flags & (GPU_BATCH_RGB | GPU_BATCH_RGBA | GPU_BATCH_RGB8 | GPU_BATCH_RGBA8));
 	GPU_bool use_byte_colors = (flags & (GPU_BATCH_RGB8 | GPU_BATCH_RGBA8));
 	GPU_bool use_z = (flags & GPU_BATCH_XYZ);
-	GPU_bool use_a = (flags & GPU_BATCH_RGBA);
+	GPU_bool use_a = (flags & (GPU_BATCH_RGBA | GPU_BATCH_RGBA8));
 
     if(num_vertices == 0)
         return;
@@ -4723,7 +4691,7 @@ static void TriangleBatchX(GPU_Renderer* renderer, GPU_Image* image, GPU_Target*
             unsigned int i;
             unsigned int index;
             float* vertex_pointer = (float*)(values);
-            float* texcoord_pointer = (float*)(values + offset_texcoords);
+            float* texcoord_pointer = (float*)((char*)values + offset_texcoords);
 
             glBegin(GL_TRIANGLES);
             for(i = 0; i < num_indices; i++)
@@ -4736,12 +4704,12 @@ static void TriangleBatchX(GPU_Renderer* renderer, GPU_Image* image, GPU_Target*
                 {
                     if(use_byte_colors)
                     {
-                        Uint8* color_pointer = (Uint8*)(values + offset_colors);
+                        Uint8* color_pointer = (Uint8*)((char*)values + offset_colors);
                         glColor4ub(color_pointer[index], color_pointer[index+1], color_pointer[index+2], (use_a? color_pointer[index+3] : 255));
                     }
                     else
                     {
-                        float* color_pointer = (float*)(values + offset_colors);
+                        float* color_pointer = (float*)((char*)values + offset_colors);
                         glColor4f(color_pointer[index], color_pointer[index+1], color_pointer[index+2], (use_a? color_pointer[index+3] : 1.0f));
                     }
                 }
@@ -4812,7 +4780,20 @@ static void TriangleBatchX(GPU_Renderer* renderer, GPU_Image* image, GPU_Target*
             if(use_colors)
             {
                 glEnableVertexAttribArray(context->current_shader_block.color_loc);
-                glVertexAttribPointer(context->current_shader_block.color_loc, size_colors, (use_byte_colors? GL_UNSIGNED_BYTE : GL_FLOAT), GL_FALSE, stride, (void*)(offset_colors));
+                if(use_byte_colors)
+                {
+                    glVertexAttribPointer(context->current_shader_block.color_loc, size_colors, GL_UNSIGNED_BYTE, GL_TRUE, stride, (void*)(offset_colors));
+                }
+                else
+                {
+                    glVertexAttribPointer(context->current_shader_block.color_loc, size_colors, GL_FLOAT, GL_FALSE, stride, (void*)(offset_colors));
+                }
+            }
+            else
+            {
+                SDL_Color color = get_complete_mod_color(renderer, target, image);
+                float default_color[4] = {color.r/255.0f, color.g/255.0f, color.b/255.0f, color.a/255.0f};
+                SetAttributefv(renderer, context->current_shader_block.color_loc, 4, default_color);
             }
         }
 
@@ -5745,7 +5726,11 @@ static GPU_bool LinkShaderProgram(GPU_Renderer* renderer, Uint32 program_object)
 
     if(!IsFeatureEnabled(renderer, GPU_FEATURE_BASIC_SHADERS))
         return GPU_FALSE;
-
+    
+    // Bind the position attribute to location 0.
+    // We always pass position data (right?), but on some systems (e.g. GL 2 on OS X), color is bound to 0
+    // and the shader won't run when TriangleBatch uses GPU_BATCH_XY_ST (no color array).  Guess they didn't consider default attribute values...
+    glBindAttribLocation(program_object, 0, "gpu_Vertex");
 	glLinkProgram(program_object);
 
 	glGetProgramiv(program_object, GL_LINK_STATUS, &linked);
